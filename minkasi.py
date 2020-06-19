@@ -2926,7 +2926,7 @@ class NoiseCMWhite:
         return self.mywt.copy()
 
 class NoiseSmoothedSVD:
-    def __init__(self,dat_use,fwhm=50,prewhiten=False,fit_powlaw=False):
+    def __init__(self,dat_use,fwhm=50,prewhiten=False,fit_powlaw=False,chisq=1.0,nfft=1,dt=1.0,f_low=0.05,f_high=20.0,cut=20.0,inBand=None):
         if prewhiten:
             noisevec=np.median(np.abs(np.diff(dat_use,axis=1)),axis=1)
             dat_use=dat_use/(np.repeat([noisevec],dat_use.shape[1],axis=0).transpose())
@@ -2945,14 +2945,78 @@ class NoiseSmoothedSVD:
                 spec_smooth[ind,1:]=C
         else:
             dat_trans=mkfftw.fft_r2r(dat_rot)
-            spec_smooth=smooth_many_vecs(dat_trans**2,fwhm)
+            #spec_smooth=smooth_many_vecs(dat_trans**2,fwhm)
+            if nfft > 1:
+                chunk=find_good_fft_lens(n/nfft)[-1]
+                nchunk=2*nfft-1
+                #self.info['nchunk']=nchunk
+                print('dividing data into',nchunk,' chunks of ',chunk*dt,' seconds')
+                shift=chunk//2
+                ffts=np.zeros((nchunk,ndet,chunk))
+                for ii in np.arange(nchunk):
+                    #print('chunck',ii)
+                    dat=dat_rot[:,ii*shift:ii*shift+chunk]
+                    ffts[ii,:,:]=(mkfftw.fft_r2r(dat))**2
+                #ave=np.median(ffts,0)
+                min_f=0.5/chunk/dt
+                n_low=max((0,int(np.floor(f_low/min_f))))
+                n_high=min((chunk-1,int(np.floor(f_high/min_f))))
+                i_chunk=np.arange(chunk,dtype=np.float)/(chunk-1)
+                n=dat_trans.shape[1]
+                i_org=np.arange(n,dtype=np.float)/(n-1)
+                st=n//chunk
+                #print(i_org.shape,st)
+                st=n//chunk #don't extrapolate over very lowest frequencies
+                ratio=np.zeros((nchunk,ndet))
+                for dd in range(ndet): #take ratio of ffts to median value
+                    #print('detector ' , dd)
+                    for ii in range(nchunk):
+                        ratio[ii,dd]=np.mean(ffts[ii,dd,n_low:n_high])
+                    no_signal=np.where(ratio[:,dd] < cut*np.min(ratio[:,dd]))
+                    ave=np.mean((ffts[no_signal,dd,:])[0,:,:],0)
+                    if not (inBand is None): 
+                        ave[n_low:n_high]=ave[n_low:n_high]*inBand
+                    dat_trans[dd,st:]=np.interp(i_org[st:],i_chunk,ave)
+                    #print('done interpol')
+                #print('finished cuts')
+            spec_smooth=smooth_many_vecs(dat_trans,fwhm)
+
         spec_smooth[:,1:]=1.0/spec_smooth[:,1:]
         spec_smooth[:,0]=0
         if prewhiten:
             self.noisevec=noisevec.copy()
         else:
             self.noisevec=None
-        self.mywt=spec_smooth
+        self.mywt=spec_smooth/chisq
+#<--------------------------------------Charles' Deletion Below ------------------------
+#    def __init__(self,dat_use,fwhm=50,prewhiten=False,fit_powlaw=False):
+#        if prewhiten:
+#            noisevec=np.median(np.abs(np.diff(dat_use,axis=1)),axis=1)
+#            dat_use=dat_use/(np.repeat([noisevec],dat_use.shape[1],axis=0).transpose())
+#        u,s,v=np.linalg.svd(dat_use,0)
+#        #print(u.shape,s.shape,v.shape)
+#        print('got svd')
+#        ndet=s.size
+#        n=dat_use.shape[1]
+#        self.v=np.zeros([ndet,ndet])
+#        self.v[:]=u.transpose()
+#        dat_rot=np.dot(self.v,dat_use)
+#        if fit_powlaw:
+#            spec_smooth=0*dat_rot
+#            for ind in range(ndet):
+#                fitp,datsqr,C=fit_ts_ps(dat_rot[ind,:]);
+#                spec_smooth[ind,1:]=C
+#        else:
+#            dat_trans=mkfftw.fft_r2r(dat_rot)
+#            spec_smooth=smooth_many_vecs(dat_trans**2,fwhm)
+#        spec_smooth[:,1:]=1.0/spec_smooth[:,1:]
+#        spec_smooth[:,0]=0
+#        if prewhiten:
+#            self.noisevec=noisevec.copy()
+#        else:
+#            self.noisevec=None
+#        self.mywt=spec_smooth
+#>-----------------------------------End Charles' Deletion -------------------------
     def apply_noise(self,dat):
         if not(self.noisevec is None):
             noisemat=np.repeat([self.noisevec],dat.shape[1],axis=0).transpose()
@@ -2992,6 +3056,17 @@ class Tod:
     def set_pix(self,map):
         ipix=map.get_pix(self)
         self.info['ipix']=ipix
+    def set_apix(self):
+        '''calculates dxel normalized to +-1 from elevation'''
+        #TBD pass in and calculate scan center's elevation vs time
+        elev=np.mean(self.info['elev'],axis=0)
+        x=np.arange(elev.shape[0])/elev.shape[0] 
+        a=np.polyfit(x,elev,2)
+        ndet=self.info['elev'].shape[0]
+        track_elev,xel=np.meshgrid(a[2]+a[1]*x+a[0]*x**2,np.ones(ndet))
+        delev=self.info['elev'] - track_elev
+        ml=np.max(np.abs(delev))
+        self.info['apix']=delev/ml
     def copy(self,copy_info=False):
         if copy_info:
             myinfo=self.info.copy()
@@ -4264,3 +4339,191 @@ def _fit_timestreams_with_derivs_old(func,pars,tods,to_fit=None,to_scale=None,to
 
         iter=iter+1
     return pp,chisq
+
+def make_rings_wSlope(edges,cent,vals,map,pixsize=2.0,fwhm=10.0,amps=None,aa=1.0,bb=1.0,rot=0.0):
+    xvec=np.arange(map.nx)
+    yvec=np.arange(map.ny)
+    xvec[map.nx//2:]=xvec[map.nx//2:]-map.nx
+    yvec[map.ny//2:]=yvec[map.ny//2:]-map.ny
+
+    xmat=np.repeat([xvec],map.ny,axis=0).transpose()
+    ymat=np.repeat([yvec],map.nx,axis=0)
+
+    rmat=np.sqrt(xmat**2+ymat**2)*pixsize
+    if isinstance(fwhm,int)|isinstance(fwhm,float):
+        sig=fwhm/np.sqrt(8*np.log(2.))
+        src_map=np.exp(-0.5*rmat**2./sig**2)
+        src_map=src_map/src_map.sum()
+    else:
+        sig=fwhm[0]/np.sqrt(8*np.log(2))
+        src_map=np.exp(-0.5*rmat**2/sig**2)*amps[0]
+        for i in range(1,len(fwhm)):
+            sig=fwhm[i]/np.sqrt(8*np.log(2))
+            src_map=src_map+np.exp(-0.5*rmat**2/sig**2)*amps[i]
+
+        src_map=src_map/src_map.sum()
+        beam_area=pixsize**2/src_map.max()
+        beam_area=beam_area/3600**2/(360**2/np.pi)
+        print('beam_area is ',beam_area*1e9,' nsr')
+    nring=len(edges)-1
+    rings=np.zeros([nring,map.nx,map.ny])
+    mypix=map.wcs.wcs_world2pix(cent[0],cent[1],1)
+    print('mypix is ',mypix)
+
+    xvec=np.arange(map.nx)
+    yvec=np.arange(map.ny)
+    xmat=np.repeat([xvec],map.ny,axis=0).transpose()
+    ymat=np.repeat([yvec],map.nx,axis=0)
+
+    srcft=np.fft.fft2(src_map)
+    xtr  = (xmat-mypix[0])*np.cos(rot) + (ymat-mypix[1])*np.sin(rot) # Rotate and translate x coords
+    ytr  = (ymat-mypix[1])*np.cos(rot) - (xmat-mypix[0])*np.sin(rot) # Rotate and translate y coords
+    rmat = np.sqrt( (xtr/aa)**2 + (ytr/bb)**2 ) * pixsize            # Elliptically scale x,y
+    #rmat=np.sqrt( (xmat-mypix[0])**2+(ymat-mypix[1])**2)*pixsize
+    #import pdb;pdb.set_trace()
+    myvals = vals[:nring]*1.0   # Get just the values that correspond to rings
+    myvals -= np.max(myvals) # Set it such that the maximum value approaches 0
+    pk2pk = np.max(myvals) - np.min(myvals)
+    myvals -= pk2pk/50.0       # Let's assume we're down about a factor of 50 at the outskirts.
+
+    for i in range(nring):
+        #rings[i,(rmat>=edges[i])&(rmat<edges[i+1]=1.0
+        if i == nring-1:
+            slope=0.0
+        else:
+            slope = (myvals[i]-myvals[i+1])/(edges[i+1]-edges[i]) # expect positve slope; want negative one.
+        rgtinedge = (rmat>=edges[i])
+        rfromin   = (rmat-edges[i])
+        initline  = rfromin[rgtinedge]*slope
+        if vals[i] != 0:
+            #rings[i,rgtinedge] = (initline + np.abs(myvals[i]))/np.abs(myvals[i])  # Should be normalized to 1 now.
+            rings[i,rgtinedge] = (myvals[i] - initline)/myvals[i]  # Should be normalized to 1 now.
+        else:
+            rings[i,rgtinedge] = 1.0
+        #print(np.max(rings[i,rgtinedge]),np.min(rings[i,rgtinedge]))
+        rgtoutedge = (rmat>=edges[i+1])
+        rings[i,rgtoutedge]=0.0
+        #import pdb;pdb.set_trace()
+        myannul = [ c1 and not(c2) for c1,c2 in zip(rgtinedge.ravel(),rgtoutedge.ravel())]
+        rannul  = rmat.ravel()[myannul]
+        #print('length of rmat=',len(rmat),' len of rannul=',len(rannul))
+        rmin    = (rmat == np.min(rannul))
+        rmout   = (rmat == np.max(rannul))
+        #print(np.max(rings[i,myannul]),np.min(rings[i,myannul]))
+        #print(rings[i,rmin],rings[i,rmout])
+        rings[i,:,:]=np.real(np.fft.ifft2(np.fft.fft2(rings[i,:,:])*srcft))
+    return rings
+
+def make_rings_wSlope_v2(edges,thetas,cent,vals,map,pixsize=2.0,fwhm=10.0,amps=None,
+                         aa=1.0,bb=1.0,rot=0.0,retSlope=False):
+    xvec=np.arange(map.nx)
+    yvec=np.arange(map.ny)
+    xvec[map.nx//2:]=xvec[map.nx//2:]-map.nx
+    yvec[map.ny//2:]=yvec[map.ny//2:]-map.ny
+
+    xmat=np.repeat([xvec],map.ny,axis=0).transpose()
+    ymat=np.repeat([yvec],map.nx,axis=0)
+
+    rmat=np.sqrt(xmat**2+ymat**2)*pixsize
+    if isinstance(fwhm,int)|isinstance(fwhm,float):
+        sig=fwhm/np.sqrt(8*np.log(2.))
+        src_map=np.exp(-0.5*rmat**2./sig**2)
+        src_map=src_map/src_map.sum()
+    else:
+        sig=fwhm[0]/np.sqrt(8*np.log(2))
+        src_map=np.exp(-0.5*rmat**2/sig**2)*amps[0]
+        for i in range(1,len(fwhm)):
+            sig=fwhm[i]/np.sqrt(8*np.log(2))
+            src_map=src_map+np.exp(-0.5*rmat**2/sig**2)*amps[i]
+
+        src_map=src_map/src_map.sum()
+        beam_area=pixsize**2/src_map.max()
+        beam_area=beam_area/3600**2/(360**2/np.pi)
+        print('beam_area is ',beam_area*1e9,' nsr')
+    nannu=len(edges)-1
+    nring=(len(edges)-1)*(len(thetas)-1)
+    rings=np.zeros([nring,map.nx,map.ny])
+    mypix=map.wcs.wcs_world2pix(cent[0],cent[1],1)
+    print('mypix is ',mypix)
+
+    xvec=np.arange(map.nx)
+    yvec=np.arange(map.ny)
+    xmat=np.repeat([xvec],map.ny,axis=0).transpose()
+    ymat=np.repeat([yvec],map.nx,axis=0)
+
+    srcft=np.fft.fft2(src_map)
+    xtr  = (xmat-mypix[0])*np.cos(rot) + (ymat-mypix[1])*np.sin(rot) # Rotate and translate x coords
+    ytr  = (ymat-mypix[1])*np.cos(rot) - (xmat-mypix[0])*np.sin(rot) # Rotate and translate y coords
+    rmat = np.sqrt( (xtr/aa)**2 + (ytr/bb)**2 ) * pixsize            # Elliptically scale x,y
+    #rmat=np.sqrt( (xmat-mypix[0])**2+(ymat-mypix[1])**2)*pixsize
+    #import pdb;pdb.set_trace()
+    myvals = vals[:nring]*1.0   # Get just the values that correspond to rings
+    myvals -= np.max(myvals) # Set it such that the maximum value approaches 0
+    pk2pk = np.max(myvals) - np.min(myvals)
+    myvals -= pk2pk/50.0       # Let's assume we're down about a factor of 50 at the outskirts.
+    tmat=np.arctan2(ymat-mypix[1],xmat-mypix[0])
+    if rot != 0:
+        tmat += rotate
+        nmt   = (tmat > np.pi) #
+        tmat[nmt] -= 2.0*np.pi # Nope, now you are in the 4th quadrant.
+
+    slopes = np.zeros(nring)
+    for i in range(nring):
+        #rings[i,(rmat>=edges[i])&(rmat<edges[i+1]=1.0
+
+        ei = int(i / (len(thetas)-1))  # Loop over rings second.
+        et = int(i % (len(thetas)-1))  # Loop over thetas first
+        #rings[i,(rmat>=edges[i])&(rmat<edges[i+1]=1.0
+        rings[i,(rmat>=edges[ei])]    = 1.0 # Include all above condition #1
+
+        if ei == nannu-1:
+            slope=0.0
+        else:
+            slope = (myvals[i]-myvals[i+1])/(edges[ei+1]-edges[ei]) # expect positve slope; want negative one.
+        slopes[i] = slope
+        rgtinedge = (rmat>=edges[i])
+        rfromin   = (rmat-edges[i])
+        initline  = rfromin[rgtinedge]*slope
+        if vals[i] != 0:
+            #rings[i,rgtinedge] = (initline + np.abs(myvals[i]))/np.abs(myvals[i])  # Should be normalized to 1 now.
+            rings[i,rgtinedge] = (myvals[i] - initline)/myvals[i]  # Should be normalized to 1 now.
+        else:
+            rings[i,rgtinedge] = 1.0
+        rings[i,(rmat>=edges[ei+1])]  = 0.0 # Exclude those outside range
+        #rings[i,(tmat>=thetas[et+1])] = 0.0 # Exclude those outside range
+        #rings[i,(tmat<thetas[et])]    = 0.0 # Exclude those outside range
+        #import pdb;pdb.set_trace()
+        #myannul = [ c1 and not(c2) for c1,c2 in zip(rgtinedge.ravel(),rgtoutedge.ravel())]
+        #rannul  = rmat.ravel()[myannul]
+        #print('length of rmat=',len(rmat),' len of rannul=',len(rannul))
+        #rmin    = (rmat == np.min(rannul))
+        #rmout   = (rmat == np.max(rannul))
+        #print(np.max(rings[i,myannul]),np.min(rings[i,myannul]))
+        #print(rings[i,rmin],rings[i,rmout])
+        rings[i,:,:]=np.real(np.fft.ifft2(np.fft.fft2(rings[i,:,:])*srcft))
+        rings[i,(tmat>=thetas[et+1])] = 0.0 # Exclude those outside range
+        rings[i,(tmat<thetas[et])]    = 0.0 # Exclude those outside range
+
+    if retSlope:
+        return rings, slopes
+    else:
+        return rings
+
+def make_gauss_map(cent,map,pixsize=2.0,fwhm=10.0,amp=1.0):
+    mypix=map.wcs.wcs_world2pix(cent[0],cent[1],1)
+    print('mypix is ',mypix)
+    xvec=np.arange(map.nx)
+    yvec=np.arange(map.ny)
+    xmat=np.repeat([xvec],map.ny,axis=0).transpose()
+    ymat=np.repeat([yvec],map.nx,axis=0)
+    rmat=np.sqrt( (xmat-mypix[0])**2+(ymat-mypix[1])**2)*pixsize
+    if isinstance(fwhm,int)|isinstance(fwhm,float):
+        sig=fwhm/np.sqrt(8*np.log(2))/pixsize  # Found 18 March 2019
+        src_map=np.exp(-0.5*rmat**2/sig**2)
+    else: 
+        assert 1==0
+
+    src_map*=amp
+    
+    return src_map
+
